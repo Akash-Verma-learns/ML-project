@@ -72,7 +72,6 @@ nav{position:sticky;top:0;z-index:100;backdrop-filter:blur(20px);background:rgba
 .bar-val{font-family:var(--font-mono);font-size:.72rem;color:var(--muted);text-align:right;}
 .bar-fill.glioma{background:linear-gradient(90deg,#ff4b6e,#ff8a65);}
 .bar-fill.meningioma{background:linear-gradient(90deg,#7b5ea7,#a78bfa);}
-.bar-fill.no_tumor{background:linear-gradient(90deg,#00ffa3,#00e5ff);}
 .bar-fill.pituitary{background:linear-gradient(90deg,#ffd166,#ff9f1c);}
 .bar-fill.angry{background:linear-gradient(90deg,#ff4b6e,#ff6b35);}
 .bar-fill.disgust{background:linear-gradient(90deg,#6bcb77,#4d9de0);}
@@ -131,13 +130,13 @@ footer{text-align:center;padding:40px 20px;font-family:var(--font-mono);font-siz
 
 <nav>
   <div class="logo">NEURO<span>LENS</span></div>
-  <div class="nav-tag">v1.0 · RESEARCH</div>
+  <div class="nav-tag">v2.0 · TRANSFORMER FUSION</div>
 </nav>
 
 <div class="hero">
   <div class="hero-label">Multimodal Neural Analysis</div>
   <h1>Emotion &amp; <strong>Brain Imaging</strong><br>AI Diagnostics</h1>
-  <p>Upload a face photo for emotion recognition or a brain MRI scan for tumor detection — powered by a fused deep learning pipeline.</p>
+  <p>Upload a face photo for emotion recognition or a brain MRI scan for tumor detection — powered by a cross-attention transformer fusion pipeline.</p>
 </div>
 
 <div class="tabs">
@@ -203,7 +202,8 @@ footer{text-align:center;padding:40px 20px;font-family:var(--font-mono);font-siz
         <div id="tum-result-area">
           <div style="color:var(--muted);font-size:.85rem;line-height:1.8;">
             Upload a brain MRI and click <strong style="color:var(--text)">Detect Tumor</strong>. Generates a Grad-CAM saliency map.<br/><br/>
-            <span style="font-family:var(--font-mono);font-size:.72rem;">CLASSES → glioma · meningioma · no_tumor · pituitary</span>
+            <!-- FIXED: was glioma · meningioma · no_tumor · pituitary (4 classes) -->
+            <span style="font-family:var(--font-mono);font-size:.72rem;">CLASSES → glioma · meningioma · pituitary</span>
           </div>
         </div>
       </div>
@@ -243,15 +243,13 @@ footer{text-align:center;padding:40px 20px;font-family:var(--font-mono);font-siz
 </div>
 
 <footer>
-  NeuroLens · Research prototype · Not for clinical use<br/>
-  Models: MobileNetV2 (FER2013) + EmotionConditionedTumorCNN (Figshare Brain)
+  NeuroLens v2.0 · Research prototype · Not for clinical use<br/>
+  Models: EfficientNet-B2 (FER2013) + EfficientNet-B0 + Cross-Attention Transformer Fusion
 </footer>
 
 <script>
-// ── File store — keeps file reference even after input zone is hidden ─────
 const fileStore = {};
 
-// ── Tab switching ─────────────────────────────────────────────────────────
 function switchTab(name, btn){
   document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));
   document.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
@@ -259,7 +257,6 @@ function switchTab(name, btn){
   btn.classList.add('active');
 }
 
-// ── File preview ──────────────────────────────────────────────────────────
 function previewFile(prefix){
   const input = document.getElementById(prefix+'-file');
   const file  = input.files[0];
@@ -286,7 +283,6 @@ function clearFile(prefix){
   if(s){ s.className='status-bar info hidden'; s.textContent=''; }
 }
 
-// ── Drag & drop ───────────────────────────────────────────────────────────
 ['emo','tum','full'].forEach(p => {
   const zone = document.getElementById(p+'-zone');
   if(!zone) return;
@@ -303,7 +299,6 @@ function clearFile(prefix){
   });
 });
 
-// ── Status helpers ────────────────────────────────────────────────────────
 function setStatus(prefix, type, msg){
   const el = document.getElementById(prefix+'-status');
   if(!el) return;
@@ -311,7 +306,6 @@ function setStatus(prefix, type, msg){
   el.textContent = msg;
 }
 
-// ── Bar HTML ──────────────────────────────────────────────────────────────
 function buildBars(probs, classes){
   return [...classes].sort((a,b) => probs[b]-probs[a]).map(cls => {
     const pct = (probs[cls]*100).toFixed(1);
@@ -323,7 +317,6 @@ function buildBars(probs, classes){
   }).join('');
 }
 
-// ── Render emotion ────────────────────────────────────────────────────────
 function renderEmotion(data, targetId){
   document.getElementById(targetId).innerHTML = `
     <span class="badge ${data.label==='happy'?'safe':'emotion'}">${data.label}</span>
@@ -339,7 +332,6 @@ function renderEmotion(data, targetId){
     <div class="bar-list">${buildBars(data.all_probs, Object.keys(data.all_probs))}</div>`;
 }
 
-// ── Render Grad-CAM 3 panels ──────────────────────────────────────────────
 function buildGradCAM(data){
   if(!data.gradcam_b64) return '';
   return `
@@ -373,13 +365,11 @@ function buildGradCAM(data){
     </div>`;
 }
 
-// ── Render tumor ──────────────────────────────────────────────────────────
 function renderTumor(data, targetId){
-  const isSafe = data.label === 'no_tumor';
   document.getElementById(targetId).innerHTML = `
-    <span class="badge ${isSafe?'safe':'tumor'}">${data.label.replace('_',' ')}</span>
+    <span class="badge tumor">${data.label.replace('_',' ')}</span>
     <div class="result-main">
-      <div class="result-emoji">${isSafe?'✅':'⚠️'}</div>
+      <div class="result-emoji">⚠️</div>
       <div>
         <div class="result-label">${data.label.replace('_',' ')}</div>
         <div class="result-conf">${(data.confidence*100).toFixed(1)}% confidence</div>
@@ -391,7 +381,6 @@ function renderTumor(data, targetId){
     ${buildGradCAM(data)}`;
 }
 
-// ── API call helper ───────────────────────────────────────────────────────
 async function callAPI(endpoint, prefix, onSuccess){
   const file = fileStore[prefix] || document.getElementById(prefix+'-file').files[0];
   if(!file){ setStatus(prefix,'error','No file selected'); return; }

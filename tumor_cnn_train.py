@@ -6,20 +6,10 @@ CHANGE FROM ORIGINAL:
   NEW: MRI features + fMRI features → Multi-Head Cross-Attention
                                        (N stacked layers) → classifier
 
-Everything else is identical:
-  - EfficientNet-B0 CNN backbone (unchanged)
-  - FMRIEncoder MLP (unchanged)
-  - Dataset loading, transforms, training loop (unchanged)
-
-Architecture of new fusion block:
-  MRI  (1280-d) → project → (256-d) ┐
-                                      Multi-Head Cross-Attn  ← layer 1
-  fMRI  (64-d)  → project → (256-d) ┘      ↓
-                                      Multi-Head Cross-Attn  ← layer 2
-                                            ↓
-                                      Multi-Head Cross-Attn  ← layer 3
-                                            ↓
-                                      LayerNorm → FC(128) → FC(3)
+WARMSTART (new):
+  If tumor_cnn_best_new.pt exists, CNN + fMRI encoder weights are
+  reused. Only the transformer fusion layers train from scratch.
+  Cuts training time from ~30 epochs to ~8-12 epochs.
 """
 
 import os, random, warnings
@@ -83,8 +73,9 @@ ONSETIME_DIR  = FMRI_DIR / "onsetime"
 
 CKPT_DIR   = Path(r"C:\Users\HP\ML_project")
 CKPT_DIR.mkdir(parents=True, exist_ok=True)
-BEST_MODEL = CKPT_DIR / "tumor_transformer_best.pt"   # new name — different arch
+BEST_MODEL = CKPT_DIR / "tumor_transformer_best.pt"
 LAST_MODEL = CKPT_DIR / "tumor_transformer_last.pt"
+OLD_CKPT   = CKPT_DIR / "tumor_cnn_best_new.pt"   # warmstart source
 
 # =====================================================
 # CONFIG
@@ -101,13 +92,11 @@ CFG = dict(
     fmri_dim      = 128,
     patience      = 8,
     seed          = 42,
-
-    # ── Transformer fusion hyperparams ──────────────
-    fusion_dim    = 256,   # project MRI+fMRI to this dim before attention
-    num_heads     = 8,     # attention heads (fusion_dim must be divisible)
-    num_layers    = 3,     # how many stacked cross-attention layers
-    ffn_dim       = 512,   # feed-forward dim inside each transformer layer
-    attn_dropout  = 0.1,   # dropout inside attention
+    fusion_dim    = 256,
+    num_heads     = 8,
+    num_layers    = 3,
+    ffn_dim       = 512,
+    attn_dropout  = 0.1,
 )
 
 TUMOR_CLASSES = ["meningioma", "glioma", "pituitary"]
@@ -116,12 +105,11 @@ NUM_CLASSES   = 3
 torch.manual_seed(CFG["seed"])
 np.random.seed(CFG["seed"])
 random.seed(CFG["seed"])
-
 print(f"Device: {DEVICE}")
 
 
 # =====================================================
-# fMRI FEATURE EXTRACTION  (unchanged)
+# fMRI FEATURE EXTRACTION
 # =====================================================
 
 def load_connectivity_features(onsetime_dir: Path, target_dim: int = 64):
@@ -148,7 +136,6 @@ def load_connectivity_features(onsetime_dir: Path, target_dim: int = 64):
             vecs.append(vec)
         except Exception as e:
             print(f"  [conn] Error {fpath.name}: {e}")
-
     if not vecs:
         return np.zeros(target_dim, dtype=np.float32)
     return np.stack(vecs).mean(axis=0).astype(np.float32)
@@ -161,7 +148,6 @@ def load_bold_features(fmri_dir: Path, target_dim: int = 64):
     ])
     if not subject_dirs:
         return None
-
     all_vecs = []
     for sub_dir in subject_dirs:
         nii_files = sorted(
@@ -187,7 +173,6 @@ def load_bold_features(fmri_dir: Path, target_dim: int = 64):
                 print(f"  [BOLD] Error {nii_path.name}: {e}")
         if run_vecs:
             all_vecs.append(np.stack(run_vecs).mean(axis=0))
-
     if not all_vecs:
         return None
     return np.stack(all_vecs, axis=0).astype(np.float32)
@@ -199,11 +184,9 @@ def extract_fmri_features(fmri_dir: Path, fmri_dim: int = 128):
     conn_vec = load_connectivity_features(ONSETIME_DIR, target_dim=half)
     print("[fMRI] Extracting BOLD activation features...")
     bold_mat = load_bold_features(fmri_dir, target_dim=half)
-
     if bold_mat is None:
         print("[fMRI] No BOLD data — fMRI branch disabled")
         return None
-
     n_sub    = bold_mat.shape[0]
     conn_bc  = np.tile(conn_vec, (n_sub, 1))
     combined = np.concatenate([conn_bc, bold_mat], axis=1)
@@ -219,7 +202,7 @@ N_SUBJECTS    = fmri_features.shape[0] if USE_FMRI else 0
 
 
 # =====================================================
-# DATASET  (unchanged)
+# DATASET
 # =====================================================
 
 def load_mat_sample(mat_path: Path):
@@ -304,7 +287,7 @@ def load_split_indices(cvind_path: Path, n_total: int = 3064):
 
 
 # =====================================================
-# TRANSFORMS  (unchanged)
+# TRANSFORMS
 # =====================================================
 
 train_tf = T.Compose([
@@ -324,7 +307,6 @@ test_tf = T.Compose([
     T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
 ])
 
-# Build datasets
 print("\n[Data] Loading split indices...")
 train_idx, test_idx = load_split_indices(CVIND_PATH)
 
@@ -348,11 +330,11 @@ test_loader  = DataLoader(test_set,  batch_size=CFG["batch_size"],
 
 
 # =====================================================
-# ENCODERS  (CNN — unchanged from original)
+# MODEL DEFINITIONS
 # =====================================================
 
 class MRIEncoder(nn.Module):
-    """EfficientNet-B0 CNN backbone → [B, 1280]  (unchanged)"""
+    """EfficientNet-B0 CNN backbone → [B, 1280]  (unchanged from original)"""
     def __init__(self, dropout=0.5):
         super().__init__()
         base          = tv_models.efficientnet_b0(
@@ -364,11 +346,11 @@ class MRIEncoder(nn.Module):
     def forward(self, x):
         x = self.features(x)
         x = self.pool(x)
-        return self.drop(x.view(x.size(0), -1))   # (B, 1280)
+        return self.drop(x.view(x.size(0), -1))
 
 
 class FMRIEncoder(nn.Module):
-    """128-d fMRI vector → 64-d  (unchanged)"""
+    """128-d fMRI vector → 64-d  (unchanged from original)"""
     def __init__(self, in_dim: int = 128, dropout: float = 0.4):
         super().__init__()
         self.net = nn.Sequential(
@@ -381,57 +363,24 @@ class FMRIEncoder(nn.Module):
         )
 
     def forward(self, x):
-        return self.net(x)   # (B, 64)
+        return self.net(x)
 
-
-# =====================================================
-# ★ NEW: MULTI-HEAD CROSS-ATTENTION FUSION TRANSFORMER
-# =====================================================
 
 class CrossAttentionLayer(nn.Module):
-    """
-    One layer of cross-attention + self-attention + feed-forward.
-
-    Step 1 — Cross-Attention:
-        MRI token QUERIES the fMRI token.
-        "Given what the CNN sees in the MRI, what fMRI info matters?"
-        The answer changes per-sample — unlike the old scalar weights.
-
-    Step 2 — Self-Attention:
-        The updated MRI token attends to itself (refines its own representation).
-
-    Step 3 — Feed-Forward Network:
-        Standard transformer FFN with GELU activation.
-
-    Each step has a residual connection + LayerNorm (Pre-LN style —
-    more stable training than Post-LN).
-    """
-    def __init__(self, dim: int, num_heads: int,
-                 ffn_dim: int, dropout: float = 0.1):
+    """One cross-attention + self-attention + FFN layer with residuals."""
+    def __init__(self, dim, num_heads, ffn_dim, dropout=0.1):
         super().__init__()
-
-        # ── Cross-attention: MRI (query) ← fMRI (key, value) ─────────────
         self.cross_attn = nn.MultiheadAttention(
-            embed_dim   = dim,
-            num_heads   = num_heads,
-            dropout     = dropout,
-            batch_first = True,   # (B, seq, dim) instead of (seq, B, dim)
-        )
+            embed_dim=dim, num_heads=num_heads,
+            dropout=dropout, batch_first=True)
         self.norm_cross = nn.LayerNorm(dim)
-
-        # ── Self-attention: MRI token refines itself ───────────────────────
         self.self_attn  = nn.MultiheadAttention(
-            embed_dim   = dim,
-            num_heads   = num_heads,
-            dropout     = dropout,
-            batch_first = True,
-        )
+            embed_dim=dim, num_heads=num_heads,
+            dropout=dropout, batch_first=True)
         self.norm_self  = nn.LayerNorm(dim)
-
-        # ── Feed-forward network ───────────────────────────────────────────
         self.ffn = nn.Sequential(
             nn.Linear(dim, ffn_dim),
-            nn.GELU(),               # smoother than ReLU, standard in transformers
+            nn.GELU(),
             nn.Dropout(dropout),
             nn.Linear(ffn_dim, dim),
             nn.Dropout(dropout),
@@ -439,80 +388,36 @@ class CrossAttentionLayer(nn.Module):
         self.norm_ffn = nn.LayerNorm(dim)
 
     def forward(self, mri_tok, fmri_tok):
-        """
-        Args:
-            mri_tok  : (B, 1, dim)  — MRI feature token
-            fmri_tok : (B, 1, dim)  — fMRI feature token
-        Returns:
-            mri_tok  : (B, 1, dim)  — updated MRI token (fMRI info absorbed)
-        """
-        # Step 1: Cross-attention (Pre-LN: normalize before attention)
+        # Cross-attention: MRI queries fMRI
         mri_norm = self.norm_cross(mri_tok)
-        attended, attn_weights = self.cross_attn(
-            query = mri_norm,    # MRI asks the question
-            key   = fmri_tok,    # fMRI provides context
-            value = fmri_tok,
-        )
-        mri_tok = mri_tok + attended    # residual connection
-
-        # Step 2: Self-attention
+        attended, attn_w = self.cross_attn(
+            query=mri_norm, key=fmri_tok, value=fmri_tok)
+        mri_tok = mri_tok + attended
+        # Self-attention
         mri_norm = self.norm_self(mri_tok)
         refined, _ = self.self_attn(mri_norm, mri_norm, mri_norm)
-        mri_tok  = mri_tok + refined    # residual connection
-
-        # Step 3: Feed-forward
+        mri_tok  = mri_tok + refined
+        # FFN
         mri_norm = self.norm_ffn(mri_tok)
-        mri_tok  = mri_tok + self.ffn(mri_norm)   # residual connection
-
-        return mri_tok, attn_weights
+        mri_tok  = mri_tok + self.ffn(mri_norm)
+        return mri_tok, attn_w
 
 
 class TransformerFusion(nn.Module):
-    """
-    Multi-layer cross-attention fusion block.
-
-    Replaces the old:
-        torch.cat([mri_1280, fmri_64]) → Linear(1344→512) → Linear(512→256) → Linear(256→3)
-
-    With:
-        project(mri_1280  → 256)  ┐
-                                   CrossAttentionLayer × N  → LayerNorm → FC(128) → FC(3)
-        project(fmri_64   → 256)  ┘
-
-    Why stacking layers helps:
-        Layer 1: MRI absorbs coarse fMRI structure info
-        Layer 2: Refines — which fMRI regions relate to the tumor location?
-        Layer 3: Fine-grained — subtle correlations between modalities
-    """
-    def __init__(self, mri_dim: int = 1280, fmri_dim: int = 64,
-                 fusion_dim: int = 256, num_heads: int = 8,
-                 num_layers: int = 3, ffn_dim: int = 512,
-                 num_classes: int = 3, dropout: float = 0.1):
+    """Multi-layer cross-attention fusion replacing torch.cat + Linear."""
+    def __init__(self, mri_dim=1280, fmri_dim=64,
+                 fusion_dim=256, num_heads=8,
+                 num_layers=3, ffn_dim=512,
+                 num_classes=3, dropout=0.1):
         super().__init__()
-
-        # Project both modalities to the same fusion_dim
-        # (required so they can interact in the same attention space)
         self.mri_proj  = nn.Sequential(
-            nn.Linear(mri_dim, fusion_dim),
-            nn.LayerNorm(fusion_dim),
-        )
+            nn.Linear(mri_dim, fusion_dim), nn.LayerNorm(fusion_dim))
         self.fmri_proj = nn.Sequential(
-            nn.Linear(fmri_dim, fusion_dim),
-            nn.LayerNorm(fusion_dim),
-        )
-
-        # Stack N cross-attention layers
+            nn.Linear(fmri_dim, fusion_dim), nn.LayerNorm(fusion_dim))
         self.layers = nn.ModuleList([
-            CrossAttentionLayer(
-                dim      = fusion_dim,
-                num_heads= num_heads,
-                ffn_dim  = ffn_dim,
-                dropout  = dropout,
-            )
+            CrossAttentionLayer(fusion_dim, num_heads, ffn_dim, dropout)
             for _ in range(num_layers)
         ])
-
-        # Final classifier head
         self.classifier = nn.Sequential(
             nn.LayerNorm(fusion_dim),
             nn.Linear(fusion_dim, 128),
@@ -520,57 +425,22 @@ class TransformerFusion(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(128, num_classes),
         )
-
-        # Store attention weights for visualization / interpretability
         self.last_attn_weights = None
 
     def forward(self, mri_feat, fmri_feat):
-        """
-        Args:
-            mri_feat  : (B, 1280)  from EfficientNet-B0
-            fmri_feat : (B, 64)    from FMRIEncoder
-        Returns:
-            logits    : (B, num_classes)
-        """
-        # Project to fusion space and add sequence dimension
-        mri_tok  = self.mri_proj(mri_feat).unsqueeze(1)    # (B, 1, fusion_dim)
-        fmri_tok = self.fmri_proj(fmri_feat).unsqueeze(1)  # (B, 1, fusion_dim)
-
-        # Pass through N stacked cross-attention layers
+        mri_tok  = self.mri_proj(mri_feat).unsqueeze(1)
+        fmri_tok = self.fmri_proj(fmri_feat).unsqueeze(1)
         attn_weights = None
         for layer in self.layers:
             mri_tok, attn_weights = layer(mri_tok, fmri_tok)
-
-        # Save for optional visualization
         self.last_attn_weights = attn_weights
+        fused  = mri_tok.squeeze(1)
+        return self.classifier(fused)
 
-        # Remove sequence dim, classify
-        fused  = mri_tok.squeeze(1)       # (B, fusion_dim)
-        logits = self.classifier(fused)   # (B, num_classes)
-        return logits
-
-
-# =====================================================
-# ★ FULL MODEL: CNN Encoders + Transformer Fusion
-# =====================================================
 
 class BrainTumorTransformer(nn.Module):
-    """
-    Full model combining:
-      - EfficientNet-B0 CNN (MRI encoder)    — kept from original
-      - FMRIEncoder MLP (fMRI encoder)       — kept from original
-      - TransformerFusion (multi-layer cross-attention) — NEW
-
-    OLD BrainTumorCNN:
-        mri (1280) + fmri (64) → cat(1344) → Linear → Linear → output
-
-    NEW BrainTumorTransformer:
-        mri (1280) → project(256) ─┐
-                                    CrossAttn×3 → LayerNorm → Linear → output
-        fmri (64)  → project(256) ─┘
-    """
-    def __init__(self, num_classes: int = 3, fmri_in_dim: int = 128,
-                 dropout: float = 0.5):
+    """EfficientNet-B0 (CNN) + FMRIEncoder + TransformerFusion."""
+    def __init__(self, num_classes=3, fmri_in_dim=128, dropout=0.5):
         super().__init__()
         self.mri_enc  = MRIEncoder(dropout=dropout)
         self.fmri_enc = FMRIEncoder(in_dim=fmri_in_dim)
@@ -586,18 +456,21 @@ class BrainTumorTransformer(nn.Module):
         )
 
     def forward(self, img, fmri=None):
-        mri_feat = self.mri_enc(img)                         # (B, 1280)
+        mri_feat = self.mri_enc(img)
         if fmri is None:
             fmri = torch.zeros(img.size(0), 128, device=img.device)
-        fmri_feat = self.fmri_enc(fmri)                      # (B, 64)
-        return self.fusion(mri_feat, fmri_feat)              # (B, num_classes)
+        fmri_feat = self.fmri_enc(fmri)
+        return self.fusion(mri_feat, fmri_feat)
 
 
-# Build model
-model    = BrainTumorTransformer(
-    num_classes  = NUM_CLASSES,
-    fmri_in_dim  = CFG["fmri_dim"],
-    dropout      = CFG["dropout"],
+# =====================================================
+# BUILD MODEL
+# =====================================================
+
+model = BrainTumorTransformer(
+    num_classes = NUM_CLASSES,
+    fmri_in_dim = CFG["fmri_dim"],
+    dropout     = CFG["dropout"],
 ).to(DEVICE)
 
 n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -607,7 +480,49 @@ print(f"[Model] Fusion: {CFG['num_layers']} cross-attention layers, "
 
 
 # =====================================================
-# LOSS / OPTIMIZER / SCHEDULER  (unchanged)
+# WARMSTART — reuse CNN + fMRI encoder weights
+# Only the 3 new transformer fusion layers train from scratch.
+# This cuts convergence time from ~30 epochs to ~8-12 epochs.
+# =====================================================
+
+if OLD_CKPT.exists():
+    print(f"\n[Warmstart] Found {OLD_CKPT.name} — loading CNN + fMRI encoder...")
+    try:
+        old_state = torch.load(str(OLD_CKPT), map_location=DEVICE, weights_only=False)
+
+        mri_state = {
+            k.replace("mri_enc.", ""): v
+            for k, v in old_state.items()
+            if k.startswith("mri_enc.")
+        }
+        fmri_state = {
+            k.replace("fmri_enc.", ""): v
+            for k, v in old_state.items()
+            if k.startswith("fmri_enc.")
+        }
+
+        if mri_state:
+            m, u = model.mri_enc.load_state_dict(mri_state, strict=True)
+            print(f"[Warmstart] MRI  encoder loaded — missing={len(m)} unexpected={len(u)}")
+        else:
+            print("[Warmstart] No mri_enc.* keys in old ckpt — CNN trains from scratch")
+
+        if fmri_state:
+            m, u = model.fmri_enc.load_state_dict(fmri_state, strict=True)
+            print(f"[Warmstart] fMRI encoder loaded — missing={len(m)} unexpected={len(u)}")
+        else:
+            print("[Warmstart] No fmri_enc.* keys in old ckpt — fMRI encoder trains from scratch")
+
+        print("[Warmstart] TransformerFusion → training from scratch")
+
+    except Exception as e:
+        print(f"[Warmstart] Load failed: {e} — training everything from scratch")
+else:
+    print(f"\n[Warmstart] {OLD_CKPT.name} not found — training everything from scratch")
+
+
+# =====================================================
+# LOSS / OPTIMIZER / SCHEDULER
 # =====================================================
 
 class FocalLoss(nn.Module):
@@ -631,14 +546,15 @@ scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=1, eta_min=1e-
 
 
 # =====================================================
-# TRAINING LOOP  (unchanged except model name in prints)
+# TRAINING LOOP
 # =====================================================
 
 best_acc, no_improve = 0.0, 0
 train_losses, val_accs = [], []
 
 print("\n" + "=" * 60)
-print(f"  Training BrainTumorTransformer ({CFG['epochs']} epochs)")
+print(f"  Training BrainTumorTransformer ({CFG['epochs']} epochs, "
+      f"patience={CFG['patience']})")
 print("=" * 60)
 
 for epoch in range(1, CFG["epochs"] + 1):
@@ -715,7 +631,7 @@ print(f"\nBest val accuracy: {best_acc:.2f}%")
 
 
 # =====================================================
-# EVALUATION  (unchanged)
+# EVALUATION
 # =====================================================
 
 model.load_state_dict(torch.load(str(BEST_MODEL), map_location=DEVICE))
@@ -742,11 +658,11 @@ axes[0].set_title("Confusion Matrix (Transformer Fusion)")
 axes[0].set_xlabel("Predicted"); axes[0].set_ylabel("True")
 axes[0].tick_params(axis="x", rotation=30)
 
-ep = range(1, len(train_losses) + 1)
-axes[1].plot(ep, train_losses, "#e74c3c", linewidth=2, label="Train Loss")
+ep_r = range(1, len(train_losses) + 1)
+axes[1].plot(ep_r, train_losses, "#e74c3c", linewidth=2, label="Train Loss")
 axes[1].set_xlabel("Epoch"); axes[1].set_ylabel("Loss", color="#e74c3c")
 ax2 = axes[1].twinx()
-ax2.plot(ep, val_accs, "#3498db", linewidth=2, label="Val Acc %")
+ax2.plot(ep_r, val_accs, "#3498db", linewidth=2, label="Val Acc %")
 ax2.set_ylabel("Accuracy %", color="#3498db")
 axes[1].set_title("Learning Curves — Transformer Fusion")
 axes[1].grid(alpha=0.3)
@@ -756,7 +672,7 @@ plt.show()
 
 
 # =====================================================
-# GRAD-CAM  (unchanged — hooks on CNN backbone)
+# GRAD-CAM
 # =====================================================
 
 class GradCAM:
@@ -796,10 +712,11 @@ def gradcam_3panel(orig_rgb, cam_np):
     heat_rgb  = cv2.cvtColor(heat, cv2.COLOR_BGR2RGB)
     alpha_map = (0.35 + 0.35 * cam_t)[:, :, np.newaxis]
     overlay   = (orig_rgb * (1 - alpha_map) + heat_rgb * alpha_map).astype(np.uint8)
-    heatmap_v = (np.zeros_like(orig_rgb) * (1 - alpha_map) + heat_rgb * alpha_map).astype(np.uint8)
-    contour_img     = overlay.copy()
-    mask            = (cam_t > 0.5).astype(np.uint8) * 255
-    contours, _     = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    heatmap_v = (np.zeros_like(orig_rgb) * (1 - alpha_map)
+                 + heat_rgb * alpha_map).astype(np.uint8)
+    contour_img = overlay.copy()
+    mask        = (cam_t > 0.5).astype(np.uint8) * 255
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     cv2.drawContours(contour_img, contours, -1, (0, 255, 180), 2)
     return overlay, heatmap_v, contour_img
 

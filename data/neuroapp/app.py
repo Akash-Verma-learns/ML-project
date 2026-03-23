@@ -1,15 +1,12 @@
 """
 NeuroApp - Flask backend with Transformer Fusion
 =================================================
-CHANGE FROM ORIGINAL:
+CHANGE FROM ORIGINAL app1.py:
   OLD: BrainTumorCNN  — torch.cat → Linear layers
   NEW: BrainTumorTransformer — Multi-Head Cross-Attention fusion
 
 The CNN backbones (EfficientNet-B0/B2) are identical.
 Only the fusion block changed, so Grad-CAM still works the same way.
-
-Load the new checkpoint:
-  TUMOR_CKPT = Path("tumor_transformer_best.pt")
 """
 
 import os, io, base64
@@ -32,12 +29,12 @@ UPLOAD_FOLDER = Path("uploads")
 OUTPUT_FOLDER = Path("outputs")
 
 EMOTION_CKPT  = Path(r"C:\Users\HP\ML_project\emotion_model_v3.pth")
-TUMOR_CKPT    = Path(r"C:\Users\HP\ML_project\tumor_transformer_best.pt")  # ← new checkpoint
+TUMOR_CKPT    = Path(r"C:\Users\HP\ML_project\tumor_transformer_best.pt")
 
 ALLOWED_EXT   = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp", ".tiff", ".tif"}
 
 EMOTION_CLASSES = ["angry", "disgust", "fear", "happy", "neutral", "sad", "surprise"]
-TUMOR_CLASSES   = ["meningioma", "glioma", "pituitary"]
+TUMOR_CLASSES   = ["meningioma", "glioma", "pituitary"]   # 3 classes — no no_tumor
 EMOTION_EMOJI   = {
     "angry": "😡", "disgust": "🤢", "fear": "😨",
     "happy": "😄", "neutral": "😐", "sad": "😢", "surprise": "😲"
@@ -48,7 +45,7 @@ HIDDEN_DIM = 256
 N_EMO      = len(EMOTION_CLASSES)
 N_TUMOR    = len(TUMOR_CLASSES)
 
-# Transformer fusion hyperparams — must match what you trained with
+# Transformer fusion hyperparams — must match tumor_cnn_train.py CFG
 FUSION_DIM  = 256
 NUM_HEADS   = 8
 NUM_LAYERS  = 3
@@ -95,7 +92,7 @@ class FaceModel(nn.Module):
 # =====================================================
 
 class TumorMRIEncoder(nn.Module):
-    """EfficientNet-B0 CNN backbone. Output: [B, 1280]  (unchanged)"""
+    """EfficientNet-B0 CNN backbone. Output: [B, 1280]"""
     def __init__(self):
         super().__init__()
         base          = tv_models.efficientnet_b0(weights=None)
@@ -106,11 +103,11 @@ class TumorMRIEncoder(nn.Module):
     def forward(self, x):
         x = self.features(x)
         x = self.pool(x)
-        return self.drop(x.view(x.size(0), -1))   # (B, 1280)
+        return self.drop(x.view(x.size(0), -1))
 
 
 class FMRIEncoder(nn.Module):
-    """128-d fMRI → 64-d  (unchanged)"""
+    """128-d fMRI → 64-d"""
     def __init__(self, in_dim=128):
         super().__init__()
         self.net = nn.Sequential(
@@ -127,26 +124,20 @@ class FMRIEncoder(nn.Module):
 
 
 # =====================================================
-# ★ NEW: TRANSFORMER FUSION  (replaces torch.cat)
+# TRANSFORMER FUSION  (replaces torch.cat)
 # =====================================================
 
 class CrossAttentionLayer(nn.Module):
-    """
-    Single cross-attention + self-attention + FFN layer.
-    MRI token queries fMRI token — interaction is per-sample.
-    """
     def __init__(self, dim, num_heads, ffn_dim, dropout=0.1):
         super().__init__()
         self.cross_attn = nn.MultiheadAttention(
             embed_dim=dim, num_heads=num_heads,
             dropout=dropout, batch_first=True)
         self.norm_cross = nn.LayerNorm(dim)
-
         self.self_attn  = nn.MultiheadAttention(
             embed_dim=dim, num_heads=num_heads,
             dropout=dropout, batch_first=True)
         self.norm_self  = nn.LayerNorm(dim)
-
         self.ffn = nn.Sequential(
             nn.Linear(dim, ffn_dim),
             nn.GELU(),
@@ -157,43 +148,28 @@ class CrossAttentionLayer(nn.Module):
         self.norm_ffn = nn.LayerNorm(dim)
 
     def forward(self, mri_tok, fmri_tok):
-        # Cross-attention: MRI queries fMRI
         mri_norm = self.norm_cross(mri_tok)
         attended, attn_w = self.cross_attn(
             query=mri_norm, key=fmri_tok, value=fmri_tok)
         mri_tok = mri_tok + attended
-
-        # Self-attention
         mri_norm = self.norm_self(mri_tok)
         refined, _ = self.self_attn(mri_norm, mri_norm, mri_norm)
         mri_tok  = mri_tok + refined
-
-        # FFN
         mri_norm = self.norm_ffn(mri_tok)
         mri_tok  = mri_tok + self.ffn(mri_norm)
-
         return mri_tok, attn_w
 
 
 class TransformerFusion(nn.Module):
-    """
-    Multi-layer cross-attention fusion.
-    Replaces: torch.cat([mri, fmri]) → Linear(1344→512) → Linear → output
-    With:     CrossAttentionLayer × N → LayerNorm → Linear → output
-    """
     def __init__(self, mri_dim=1280, fmri_dim=64,
                  fusion_dim=256, num_heads=8,
                  num_layers=3, ffn_dim=512,
                  num_classes=3, dropout=0.1):
         super().__init__()
         self.mri_proj  = nn.Sequential(
-            nn.Linear(mri_dim, fusion_dim),
-            nn.LayerNorm(fusion_dim),
-        )
+            nn.Linear(mri_dim, fusion_dim), nn.LayerNorm(fusion_dim))
         self.fmri_proj = nn.Sequential(
-            nn.Linear(fmri_dim, fusion_dim),
-            nn.LayerNorm(fusion_dim),
-        )
+            nn.Linear(fmri_dim, fusion_dim), nn.LayerNorm(fusion_dim))
         self.layers = nn.ModuleList([
             CrossAttentionLayer(fusion_dim, num_heads, ffn_dim, dropout)
             for _ in range(num_layers)
@@ -207,19 +183,15 @@ class TransformerFusion(nn.Module):
         )
 
     def forward(self, mri_feat, fmri_feat):
-        mri_tok  = self.mri_proj(mri_feat).unsqueeze(1)    # (B, 1, 256)
-        fmri_tok = self.fmri_proj(fmri_feat).unsqueeze(1)  # (B, 1, 256)
+        mri_tok  = self.mri_proj(mri_feat).unsqueeze(1)
+        fmri_tok = self.fmri_proj(fmri_feat).unsqueeze(1)
         for layer in self.layers:
             mri_tok, _ = layer(mri_tok, fmri_tok)
-        fused  = mri_tok.squeeze(1)
-        return self.classifier(fused)
+        return self.classifier(mri_tok.squeeze(1))
 
 
 class BrainTumorTransformer(nn.Module):
-    """
-    Full model: EfficientNet-B0 (CNN) + FMRIEncoder + TransformerFusion.
-    Same interface as old BrainTumorCNN — drop-in replacement for app.py.
-    """
+    """Full model: EfficientNet-B0 CNN + FMRIEncoder + TransformerFusion."""
     def __init__(self, num_classes=3, fmri_in_dim=128):
         super().__init__()
         self.mri_enc  = TumorMRIEncoder()
@@ -331,7 +303,7 @@ load_tumor_model()
 
 
 # =====================================================
-# TRANSFORMS  (unchanged)
+# TRANSFORMS
 # =====================================================
 
 emotion_tf = T.Compose([
@@ -348,7 +320,7 @@ tumor_tf = T.Compose([
 
 
 # =====================================================
-# INFERENCE HELPERS  (unchanged)
+# INFERENCE HELPERS
 # =====================================================
 
 def predict_emotion(pil_img: Image.Image):
@@ -369,7 +341,7 @@ def predict_emotion(pil_img: Image.Image):
 def predict_tumor(pil_img: Image.Image, emotion_vec=None):
     import cv2
 
-    tensor = tumor_tf(pil_img).unsqueeze(0).to(DEVICE)
+    tensor      = tumor_tf(pil_img).unsqueeze(0).to(DEVICE)
     gradients   = [None]
     activations = [None]
 
@@ -379,7 +351,6 @@ def predict_tumor(pil_img: Image.Image, emotion_vec=None):
     def bwd_hook(m, gi, go):
         gradients[0] = go[0].detach().clone()
 
-    # Hook on CNN backbone's last conv block (unchanged — CNN is still there)
     last_conv = tumor_model.mri_enc.features[-1]
     h1 = last_conv.register_forward_hook(fwd_hook)
     h2 = last_conv.register_full_backward_hook(bwd_hook)
@@ -397,7 +368,6 @@ def predict_tumor(pil_img: Image.Image, emotion_vec=None):
         h1.remove()
         h2.remove()
 
-    # Grad-CAM (unchanged)
     grad    = gradients[0].squeeze(0)
     act     = activations[0].squeeze(0)
     weights = F.relu(grad).mean(dim=(1, 2))
@@ -443,7 +413,7 @@ def predict_tumor(pil_img: Image.Image, emotion_vec=None):
 
 
 # =====================================================
-# ROUTES  (unchanged)
+# ROUTES
 # =====================================================
 
 @app.route("/")
@@ -464,7 +434,8 @@ def api_emotion():
     if not f.filename:
         return jsonify({"error": "No file selected"}), 400
     if not allowed_file(f.filename):
-        return jsonify({"error": f"Unsupported type '{Path(f.filename).suffix}'"}), 400
+        return jsonify({"error": f"Unsupported type '{Path(f.filename).suffix}'. "
+                                 f"Allowed: {', '.join(sorted(ALLOWED_EXT))}"}), 400
     try:
         return jsonify(predict_emotion(Image.open(f.stream).convert("RGB")))
     except Exception as e:
@@ -479,7 +450,8 @@ def api_tumor():
     if not f.filename:
         return jsonify({"error": "No file selected"}), 400
     if not allowed_file(f.filename):
-        return jsonify({"error": f"Unsupported type '{Path(f.filename).suffix}'"}), 400
+        return jsonify({"error": f"Unsupported type '{Path(f.filename).suffix}'. "
+                                 f"Allowed: {', '.join(sorted(ALLOWED_EXT))}"}), 400
     try:
         img            = Image.open(f.stream).convert("RGB")
         emotion_result = None
@@ -500,7 +472,8 @@ def api_full():
     if not f.filename:
         return jsonify({"error": "No file selected"}), 400
     if not allowed_file(f.filename):
-        return jsonify({"error": f"Unsupported type '{Path(f.filename).suffix}'"}), 400
+        return jsonify({"error": f"Unsupported type '{Path(f.filename).suffix}'. "
+                                 f"Allowed: {', '.join(sorted(ALLOWED_EXT))}"}), 400
     try:
         img = Image.open(f.stream).convert("RGB")
         emo = predict_emotion(img)
